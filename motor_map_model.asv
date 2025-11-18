@@ -1,77 +1,249 @@
-% updated motor map demo with datasheet limits
+function sim = Updated_AMK_Motor_Model(Vbus, torque_cmd_fh, mode, varargin)
+%  Inputs:
+%  mat_files      : cell array of .mat filenames (order corresponds to temps)
+%  Vbus           : DC bus voltage [V]
+%  torque_cmd_fh  : function handle T_cmd(t) [Nm]
+%  mode           : 'integrate' or 'prescribed'
 
-clear; clc; close all;
-% Datasheet constants
-p       = 5;           % pole pairs
-R_s     = 0.135;       % stator resistance [ohm]
-Ld      = 0.24e-3;     % [H]
-Lq      = 0.12e-3;     % [H]
-kt      = 0.26;        % Nm/Arms
-J       = 2.74e-4;     % [kg*m^2]
+% Output: sim struct with time-series fields (time, rpm, I_rms, ia/ib/ic,
+%         torque_del, losses, tempC, flags, motormap metadata)
 
-I_max   = 105;         % Arms
-V_dc    = 350;         % V (nominal DC bus)
-V_margin= 30;          % V reserve margin
+%C CURRENTLY WORKING ON A DOCUMENT FACT CHECKING AND EXPLAINING EVERYTHING,
+% PLEASE ASK ME DIRECTLY FOR NOW. ALSO, NOT ENTIRELY CONFIDENT ABOUT THE
+% TEMPERATURE BLEND. Also it doesnn't refeed into it for now, bit confused
+% how that works with the entire vehicle sim
 
-% Load MAT files
-data80  = load('A2370DD_T80C.mat');
-data100 = load('A2370DD_T100C.mat');
-data120 = load('A2370DD_T120C.mat');
+mat_files = {'A2370DD_T80C.mat', 'A2370DD_T100C.mat', 'A2370DD_T120C.mat'};
 
-% Axes setup (hopefully this is right)
-rpm_vec = data100.Speed(:,1);          
-T_vec   = data100.Shaft_Torque(1,:);   
+% parse, but I dont know if this is necessary
+if nargin==0, error(Vbus, torque_cmd_fh, mode'); end
+p = inputParser;
+addParameter(p,'speed_profile',@(t) 3000*ones(size(t)));
+addParameter(p,'initialTempC',80); %starting motor temp should prob feed into as input
+addParameter(p,'temp_points',[80 100 120]);
+addParameter(p,'J',2.74e-4); 
+addParameter(p,'viscous',0.01);
+addParameter(p,'dt',0.001);
+addParameter(p,'tfinal',2.0);
+addParameter(p,'m_cp',1000);
+addParameter(p,'h_conv',1.0);
+addParameter(p,'I_limit',105);
+addParameter(p,'polePairs',5);
+addParameter(p,'plotResults',true);
+parse(p,varargin{:});
+opts = p.Results;
 
-% Build gridded interpolnts
-fields = {'Shaft_Torque','Id_RMS','Iq_RMS','Stator_Current_Phase_RMS',...
-          'Vd_RMS','Vq_RMS','Total_Loss','Stator_Copper_Loss',...
-          'Iron_Loss','Magnet_Loss','Mechanical_Loss'};
-
-maps80 = struct(); maps100 = struct(); maps120 = struct();
-
-for i = 1:length(fields)
-    f = fields{i};
-    maps80.(f)  = griddedInterpolant({rpm_vec, T_vec}, data80.(f),  'linear','nearest');
-    maps100.(f) = griddedInterpolant({rpm_vec, T_vec}, data100.(f), 'linear','nearest');
-    maps120.(f) = griddedInterpolant({rpm_vec, T_vec}, data120.(f), 'linear','nearest');
+Nf = numel(mat_files);
+if numel(opts.temp_points)~=Nf
+    error('temp_points length must equal number of mat files');
 end
 
-% Temperature blending (temp solution... I think)
-tempBlend = @(map80,map120,rpmq,Tq,Tm) ...
-    clip((Tm-80)/(120-80), 0, 1) .* map120(rpmq,Tq) + ...
-    (1-max(0,min(1,(Tm-80)/(120-80)))) .* map80(rpmq,Tq));
 
-% Example query (test with limits)
-rpm_q  = 8000;   % rpm
-Tq_req = 15;     % requested torque [Nm]
-Tmotor = 95;     % degC
+% load .mat files ---
+mot = struct();
+mot.F = struct(); 
+fields_needed = { ...
+    'Shaft_Torque','Electromagnetic_Torque', ...
+    'Stator_Current_Line_RMS','Stator_Current_Phase_RMS','Stator_Current_Line_Peak','Stator_Current_Phase_Peak', ...
+    'Vd_RMS','Vq_RMS','Vd_Peak','Vq_Peak', ...
+    'Total_Loss','Stator_Copper_Loss','Iron_Loss','Magnet_Loss','Mechanical_Loss', ...
+    'Id_RMS','Iq_RMS','Id_Peak','Iq_Peak','Speed' };
 
-% Interpolated values
-Iq_val = tempBlend(maps80.Iq_RMS, maps120.Iq_RMS, rpm_q, Tq_req, Tmotor);
-Id_val = tempBlend(maps80.Id_RMS, maps120.Id_RMS, rpm_q, Tq_req, Tmotor);
-Iphase = tempBlend(maps80.Stator_Current_Phase_RMS, maps120.Stator_Current_Phase_RMS, rpm_q, Tq_req, Tmotor);
-Vd_val = tempBlend(maps80.Vd_RMS, maps120.Vd_RMS, rpm_q, Tq_req, Tmotor);
-Vq_val = tempBlend(maps80.Vq_RMS, maps120.Vq_RMS, rpm_q, Tq_req, Tmotor);
-Ploss  = tempBlend(maps80.Total_Loss, maps120.Total_Loss, rpm_q, Tq_req, Tmotor);
-Torque = tempBlend(maps80.Shaft_Torque, maps120.Shaft_Torque, rpm_q, Tq_req, Tmotor);
+% initialize cell arrays for maps
+mapNames = { 'Shaft_Torque', 'Electromagnetic_Torque', 'Stator_Current_Line_RMS', ...
+    'Stator_Current_Phase_RMS', 'Vd_RMS', 'Vq_RMS', 'Total_Loss', ...
+    'Stator_Copper_Loss', 'Iron_Loss', 'Magnet_Loss', 'Mechanical_Loss', ...
+    'Id_RMS','Iq_RMS', 'Id_Peak','Iq_Peak' };
 
-% Enforce current limit
-if Iphase > I_max
-    scale = I_max / Iphase;
-    Iq_val = Iq_val*scale; 
-    Id_val = Id_val*scale;
-    Torque = Torque*scale;
-    Iphase = I_max;
+for fn = 1:numel(mapNames)
+    mot.F.(mapNames{fn}) = cell(1,Nf);
 end
 
-% Enforce voltage limit
-V_lim = (V_dc - V_margin)/sqrt(3); % approximate phase RMS
-V_req = sqrt(Vd_val^2 + Vq_val^2);
-if V_req > V_lim
-    Torque = Torque * (V_lim/V_req); % scale torque down
+mot.Speed = cell(1,Nf);
+mot.Current = cell(1,Nf);
+mot.kT = zeros(1,Nf);
+mot.temp_points = opts.temp_points;
+
+for i = 1:Nf
+    data = load(mat_files{i});
+
+    Speed = data.Speed(:);
+    Current = data.Stator_Current_Line_RMS(:)';
+
+    mot.Speed{i} = Speed;
+    mot.Current{i} = Current;
+
+    for fn = 1:numel(mapNames)
+        name = mapNames{fn};
+        if ~isfield(data,name)
+            mot.F.(name){i} = [];
+            continue;
+        end
+        M = data.(name);
+        mot.F.(name){i} = griddedInterpolant({Current,Speed},M.','linear','nearest');
+    end
+
+    % kT computed from map but overridden below but Im keeping for now to
+    % confirm
+    midI = Current(round(end/2));
+    midS = Speed(round(end/2));
+    if ~isempty(mot.F.Electromagnetic_Torque{i}) && ~isempty(mot.F.Stator_Current_Phase_RMS{i})
+        tau_mid = mot.F.Electromagnetic_Torque{i}(midI,midS);
+        Iph_mid = mot.F.Stator_Current_Phase_RMS{i}(midI,midS);
+        mot.kT(i) = tau_mid / max(Iph_mid,1e-9);
+    else
+        mot.kT(i) = 0.24;
+    end
 end
 
-fprintf('At %.0f rpm, %.1f Nm req, %.0f °C:\n', rpm_q,Tq_req,Tmotor);
-fprintf(' -> Torque=%.2f Nm, Iphase=%.1f A, Vreq=%.1f V, Loss=%.1f W\n',...
-    Torque,Iphase,V_req,Ploss);
+% OVERRIDE kT
+mot.kT(:) = 0.24;
+
+% blended maps across temperatures
+function val = eval_map(fieldName, Ival, spd_rpm, TmotorC)
+    Tp = mot.temp_points(:)';
+    if isscalar(Tp)
+        w = 1;
+    else
+        Tm = max(min(TmotorC, max(Tp)), min(Tp));
+        if Tm <= Tp(1)
+            w = zeros(1,Nf); w(1)=1;
+        elseif Tm >= Tp(end)
+            w = zeros(1,Nf); w(end)=1;
+        else
+            hi = find(Tp > Tm,1); lo = hi-1;
+            w = zeros(1,Nf);
+            w(lo) = (Tp(hi)-Tm)/(Tp(hi)-Tp(lo));
+            w(hi) = 1 - w(lo);
+        end
+    end
+    val = 0;
+    for ii=1:Nf
+        if w(ii)==0, continue; end
+        F = mot.F.(fieldName){ii};
+        if isempty(F)
+            val = val + w(ii)*0;
+        else
+            val = val + w(ii)*F(Ival, spd_rpm);
+        end
+    end
+end
+
+dt = opts.dt; t = 0:dt:opts.tfinal; Nt = numel(t);
+rpm = zeros(Nt,1); omega = zeros(Nt,1);
+I_rms = zeros(Nt,1); ia=zeros(Nt,1); ib=zeros(Nt,1); ic=zeros(Nt,1);
+torque_del = zeros(Nt,1); losses = zeros(Nt,1); tempC=zeros(Nt,1);
+flags.current_limited=false(Nt,1); flags.voltage_limited=false(Nt,1); flags.temp_derated=false(Nt,1);
+
+rpm(1) = opts.speed_profile(0); omega(1)=rpm(1)*2*pi/60; tempC(1)=opts.initialTempC;
+V_phase_limit = 0.612 * Vbus; I_limit = opts.I_limit; polePairs = opts.polePairs;
+theta_e = 0;
+
+for k=1:Nt-1
+    tk = t(k);
+    Tcmd = torque_cmd_fh(tk);
+    sign_cmd = sign(Tcmd); if sign_cmd==0, sign_cmd=1; end
+
+    % blend kT based on temperature (but mot.kT was overridden to datasheet value)
+    if Nf==1
+        kT_now = mot.kT(1);
+    else
+        Tp = mot.temp_points; Tm = max(min(tempC(k), max(Tp)), min(Tp));
+        if Tm<=Tp(1), w = [1, zeros(1,Nf-1)];
+        elseif Tm>=Tp(end), w = [zeros(1,Nf-1),1];
+        else hi = find(Tp > Tm,1); lo=hi-1; w=zeros(1,Nf); w(lo) = (Tp(hi)-Tm)/(Tp(hi)-Tp(lo)); w(hi)=1-w(lo);
+        end
+        kT_now = sum(w .* mot.kT);
+    end
+
+    % 1) compute required total stator RMS current
+    I_req = abs(Tcmd) / max(kT_now,1e-9);
+
+    % 2) apply inverter current limit
+    I_act = min(I_req, I_limit);
+    if I_act < I_req, flags.current_limited(k)=true; end
+
+    % clamp speed into first file's speed range (assume same for all)
+    spd_rpm = max(min(rpm(k), mot.Speed{1}(end)), mot.Speed{1}(1));
+
+    % 3) voltage check using maps (Vd_RMS, Vq_RMS) with I_act and spd
+    Vd = eval_map('Vd_RMS', I_act, spd_rpm, tempC(k));
+    Vq = eval_map('Vq_RMS', I_act, spd_rpm, tempC(k));
+    Vmag = hypot(Vd, Vq);
+    if Vmag > V_phase_limit
+        scale = V_phase_limit / Vmag;
+        I_act = I_act * scale;
+        flags.voltage_limited(k)=true;
+    end
+
+    % 4) temp derating above highest temp point
+    TmaxSafe = max(mot.temp_points);
+    if tempC(k) > TmaxSafe
+        der = max(0, 1 - (tempC(k)-TmaxSafe)/40);
+        if der < 1, I_act = I_act * der; flags.temp_derated(k)=true; end
+    end
+
+    % 5) read maps: torque, losses, phase r.m.s current, etc.
+    torque_map = eval_map('Shaft_Torque', I_act, spd_rpm, tempC(k));
+    if isempty(torque_map), torque_map = eval_map('Electromagnetic_Torque', I_act, spd_rpm, tempC(k)); end
+    total_loss = eval_map('Total_Loss', I_act, spd_rpm, tempC(k));
+    Iphase_rms = eval_map('Stator_Current_Phase_RMS', I_act, spd_rpm, tempC(k));
+
+    torque_del(k) = torque_map * sign_cmd;
+    losses(k) = total_loss;
+    I_rms(k) = Iphase_rms;
+
+    % 6) phase sinusoids
+    Ipeak = sqrt(2) * Iphase_rms;
+    we = omega(k) * polePairs; % electrical rad/s
+    theta_e = theta_e + we*dt;
+    ia(k) = Ipeak * sin(theta_e);
+    ib(k) = Ipeak * sin(theta_e - 2*pi/3);
+    ic(k) = Ipeak * sin(theta_e + 2*pi/3);
+
+    % 7) thermal update
+    Tamb = 25;
+    dT = (losses(k) - opts.h_conv*(tempC(k)-Tamb)) * dt / opts.m_cp;
+    tempC(k+1) = tempC(k) + dT;
+
+    % 8) mechanical update
+    if strcmpi(mode,'integrate')
+        Tload = opts.viscous * omega(k);
+        alpha = (torque_del(k) - Tload) / opts.J;
+        omega(k+1) = omega(k) + alpha*dt;
+        rpm(k+1) = max(0, omega(k+1)*60/(2*pi));
+    else
+        rpm(k+1) = opts.speed_profile(tk+dt);
+        omega(k+1) = rpm(k+1)*2*pi/60;
+    end
+
+    % --- enforce mechanical max speed from datasheet ---
+    rpm(k+1) = min(rpm(k+1), 20000);     % max mechanical speed (rpm)
+    omega(k+1) = rpm(k+1)*2*pi/60;
+end
+
+torque_del(end)=torque_del(end-1); losses(end)=losses(end-1); I_rms(end)=I_rms(end-1);
+ia(end)=ia(end-1); ib(end)=ib(end-1); ic(end)=ic(end-1);
+
+% package outputs and plots done by chat i dont understand why this jumbo
+% is neccesary (for now)
+sim.time = t(:); sim.rpm = rpm; sim.omega = omega;
+sim.I_rms = I_rms; sim.ia=ia; sim.ib=ib; sim.ic=ic;
+sim.torque_del = torque_del; sim.losses = losses; sim.tempC = tempC;
+sim.flags = flags; sim.motor = mot; sim.Vbus = Vbus;
+% kT_used: last blended value
+if exist('kT_now','var'), sim.kT_used = kT_now; else sim.kT_used = mean(mot.kT); end
+
+% optional plots
+if opts.plotResults
+    figure;
+    subplot(3,2,1); plot(t,rpm); ylabel('RPM'); grid on;
+    subplot(3,2,2); plot(t,torque_del); ylabel('Torque [Nm]'); grid on;
+    subplot(3,2,3); plot(t,I_rms); ylabel('I_{rms} [A]'); grid on;
+    subplot(3,2,4); plot(t,losses); ylabel('Losses [W]'); grid on;
+    subplot(3,2,5); plot(t,tempC); ylabel('Temp [°C]'); grid on; xlabel('Time (s)');
+    subplot(3,2,6); plot(t,double(flags.current_limited)); ylabel('current-limited'); ylim([-0.1 1.1]);
+    sgtitle('AMK Motor Simulation (MAT maps) - datasheet params applied');
+end
+end
 
